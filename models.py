@@ -29,3 +29,10 @@ class Student(Base):
     group_id = Column(Integer, ForeignKey('groups.id'))
     group = relationship("Group", back_populates="students")
     attendances = relationship("Attendance", back_populates="student")
+
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    password = Column(String)
+    last_activity = Column(DateTime, default=datetime.utcnow)

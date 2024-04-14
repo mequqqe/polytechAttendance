@@ -4,6 +4,7 @@ import telebot
 from database import SessionLocal, init_db
 from models import Student, Attendance, Group
 from datetime import datetime
+from models import User
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 import csv
 
@@ -11,6 +12,8 @@ TOKEN = '7023709428:AAFvL7q7wUOwcxe0m5s-DYYsxx4-RDOwztY'
 bot = telebot.TeleBot(TOKEN)
 
 PREFIXES = ["ИС", "ТМ", "П", "ЭВМ", "РЭТ", "КПИиА"]
+
+auth_users = {}
 
 init_db()  # Инициализация базы данных
 
@@ -39,6 +42,13 @@ def start_bot():
         start_bot()  # Перезапуск бота, если он упал
         time.sleep(1) # Пауза между итерациями цикла
     
+def update_auth_users(user_id, is_auth):
+    auth_users[user_id] = is_auth
+
+# Функция для проверки авторизации пользователя
+def is_user_auth(user_id):
+    return user_id in auth_users and auth_users[user_id]    
+    
 def export_attendance_data():
     session = SessionLocal()
     filename = f"attendance_data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
@@ -59,11 +69,48 @@ def export_attendance_data():
         session.close()
     return filename
 
+@bot.message_handler(commands=['login'])
+def login(message):
+    bot.send_message(message.chat.id, "Введите ваш логин:")
+    bot.register_next_step_handler(message, process_username_step)
+
+def process_username_step(message):
+    username = message.text
+    bot.send_message(message.chat.id, "Введите ваш пароль:")
+    bot.register_next_step_handler(message, lambda m: process_password_step(m, username))
+
+def process_password_step(message, username):
+    password = message.text
+    session = SessionLocal()
+    user = session.query(User).filter(User.username == username, User.password == password).first()
+    session.close()
+    if user:
+        bot.send_message(message.chat.id, "Вы успешно вошли в систему!")
+        update_auth_users(message.from_user.id, True)  # Сохраняем информацию об авторизации пользователя
+    else:
+        bot.send_message(message.chat.id, "Неверный логин или пароль!")
+
+# Обработчик команды /logout
+@bot.message_handler(commands=['logout'])
+def logout(message):
+    bot.send_message(message.chat.id, "Вы вышли из системы!")
+    # Здесь можно сбросить флаг авторизации для пользователя
+
+# Декоратор для проверки авторизации перед выполнением команд
+def auth_required(func):
+    def wrapper(message):
+        if is_user_auth(message.from_user.id):
+            func(message)
+        else:
+            bot.send_message(message.chat.id, "Вы не авторизованы!")
+    return wrapper
+
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     bot.reply_to(message, "Привет! Чтобы отметить студента, начните с выбора группы командой /groups")
 
 @bot.message_handler(commands=['groups'])
+@auth_required
 def choose_prefix(message):
     keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
     for prefix in PREFIXES:
