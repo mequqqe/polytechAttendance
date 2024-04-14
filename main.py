@@ -1,12 +1,11 @@
+import time
+import schedule
 import telebot
 from database import SessionLocal, init_db
 from models import Student, Attendance, Group
 from datetime import datetime
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from enum import Enum
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 import csv
-from datetime import datetime
-from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
 TOKEN = '7023709428:AAFvL7q7wUOwcxe0m5s-DYYsxx4-RDOwztY'
 bot = telebot.TeleBot(TOKEN)
@@ -15,18 +14,31 @@ PREFIXES = ["ИС", "ТМ", "П", "ЭВМ", "РЭТ", "КПИиА"]
 
 init_db()  # Инициализация базы данных
 
-class BotState(Enum):
-    NORMAL = 0
-    CHOOSING_GROUP = 1
-    CHOOSING_STUDENT = 2
-    CHOOSING_ACTION = 3
-    WAITING_FOR_MINUTES = 4
-    ADDING_STUDENTS = 5
-    CHOOSING_PREFIX = 6
+def ping_bot():
+    try:
+        bot.send_chat_action(chat_id="2099795903", action="typing")
+        print("Bot is alive!")
+    except Exception as e:
+        print(f"Bot is down! Error: {e}")
+        print("Restarting bot...")
+        start_bot()
 
-# Словарь для отслеживания состояний пользователей
-user_states = {}
+schedule.every(5).minutes.do(ping_bot)
 
+def start_bot():
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        print(f"Error in polling: {e}")
+        print("Restarting bot...")
+        start_bot()  # Перезапуск бота при возникновении ошибки
+
+# Бесконечный цикл для выполнения заданий планировщика и перезапуска бота
+    while True:
+        schedule.run_pending()  # Выполнение запланированных заданий
+        start_bot()  # Перезапуск бота, если он упал
+        time.sleep(1) # Пауза между итерациями цикла
+    
 def export_attendance_data():
     session = SessionLocal()
     filename = f"attendance_data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv"
@@ -47,71 +59,83 @@ def export_attendance_data():
         session.close()
     return filename
 
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    bot.reply_to(message, "Привет! Чтобы отметить студента, начните с выбора группы командой /groups")
 
+@bot.message_handler(commands=['groups'])
+def choose_prefix(message):
+    keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for prefix in PREFIXES:
+        keyboard.add(prefix)
+    bot.send_message(message.chat.id, "Выберите отделениие:", reply_markup=keyboard)
+    bot.register_next_step_handler(message, list_groups)
 
-def set_state(user_id, state, data=None):
-    user_states[user_id] = (state, data)
-
-def get_state(user_id):
-    return user_states.get(user_id, (BotState.NORMAL, None))
-
-def create_groups_markup(groups):
-    markup = InlineKeyboardMarkup()
-    for group in groups:
-        markup.add(InlineKeyboardButton(text=group.name, callback_data=f'group_{group.id}'))
-    return markup
-
-def create_students_markup(students):
-    markup = InlineKeyboardMarkup()
-    for student in students:
-        button_text = f"{student.first_name} {student.last_name}"
-        markup.add(InlineKeyboardButton(text=button_text, callback_data=f'student_{student.id}'))
-    return markup
-
-def add_group(name):
+def list_groups(message):
+    prefix = message.text
     session = SessionLocal()
     try:
-        new_group = Group(name=name)
-        session.add(new_group)
-        session.commit()
-        return new_group.id  # Возвращаем ID новой группы
+        groups = session.query(Group).filter(Group.name.like(f'{prefix}%')).all()
+        if groups:
+            markup = InlineKeyboardMarkup()
+            for group in groups:
+                markup.add(InlineKeyboardButton(text=group.name, callback_data=f'group_{group.id}'))
+            bot.send_message(message.chat.id, "Выберите группу:", reply_markup=markup)
+        else:
+            bot.send_message(message.chat.id, f"Нет групп с префиксом '{prefix}'.")
     except Exception as e:
-        print(f"Ошибка при добавлении группы: {e}")
-        return None
+        bot.send_message(message.chat.id, f"Ошибка: {e}")
     finally:
         session.close()
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith('group_'))
+def callback_select_group(call):
+    group_id = int(call.data.split('_')[1])
+    session = SessionLocal()  # Создаем новую сессию
+    students = session.query(Student).filter(Student.group_id == group_id).all()
+    markup = InlineKeyboardMarkup()
+    for student in students:
+        markup.add(InlineKeyboardButton(text=f"{student.first_name} {student.last_name}", callback_data=f'student_{student.id}'))
+    bot.send_message(call.message.chat.id, "Выберите студента:", reply_markup=markup)
+    session.close()  # Не забудьте закрыть сессию
 
-def mark_attendance_late(message, student_id, minutes_late):
-    session = SessionLocal()
+@bot.callback_query_handler(func=lambda call: call.data.startswith('student_'))
+def callback_select_student(call):
+    student_id = int(call.data.split('_')[1])
+    markup = InlineKeyboardMarkup()
+    markup.add(InlineKeyboardButton(text="Опоздал", callback_data=f'late_{student_id}'))
+    markup.add(InlineKeyboardButton(text="Отсутствует", callback_data=f'absent_{student_id}'))
+    bot.send_message(call.message.chat.id, "Выберите статус студента:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('late_'))
+def callback_mark_late(call):
+    student_id = int(call.data.split('_')[1])
+    bot.send_message(call.message.chat.id, "Введите количество минут опоздания:")
+    bot.register_next_step_handler(call.message, lambda message: mark_attendance_late(message, student_id))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('absent_'))
+def callback_mark_absent(call):
+    student_id = int(call.data.split('_')[1])
+    mark_attendance_absent(call.message, student_id)
+
+def mark_attendance_late(message, student_id):
     try:
+        minutes_late = int(message.text)
+        session = SessionLocal()
         attendance = Attendance(date=datetime.now(), status="Опоздал", minutes_late=minutes_late, student_id=student_id)
         session.add(attendance)
         session.commit()
         bot.reply_to(message, f"Опоздание на {minutes_late} минут успешно отмечено.")
+    except ValueError:
+        bot.reply_to(message, "Пожалуйста, введите число. Попробуйте снова.")
     except Exception as e:
         bot.reply_to(message, f"Ошибка: {e}")
     finally:
         session.close()
 
-
-def add_students_to_group(group_id, students_list):
-    session = SessionLocal()
-    try:
-        for student_name in students_list:
-            first_name, last_name = student_name.strip().split(' ', 1)
-            new_student = Student(first_name=first_name, last_name=last_name, group_id=group_id)
-            session.add(new_student)
-        session.commit()
-    except Exception as e:
-        session.rollback()
-        print(f"Ошибка при добавлении студентов: {e}")
-    finally:
-        session.close()
-
 def mark_attendance_absent(message, student_id):
-    session = SessionLocal()
     try:
+        session = SessionLocal()
         attendance = Attendance(date=datetime.now(), status="Отсутствует", minutes_late=0, student_id=student_id)
         session.add(attendance)
         session.commit()
@@ -121,111 +145,11 @@ def mark_attendance_absent(message, student_id):
     finally:
         session.close()
 
-def create_prefixes_keyboard():
-    keyboard = ReplyKeyboardMarkup(resize_keyboard=True)
-    for prefix in PREFIXES:
-        keyboard.add(KeyboardButton(prefix))
-    return keyboard
-
-
-@bot.message_handler(commands=['start', 'help'])
-def send_welcome(message):
-    bot.reply_to(message, "Привет! Чтобы отметить студента, начните с выбора группы командой /groups")
-
-@bot.message_handler(commands=['groups'])
-def choose_prefix(message):
-    bot.send_message(message.chat.id, "Выберите отделениие:", reply_markup=create_prefixes_keyboard())
-    set_state(message.from_user.id, BotState.CHOOSING_PREFIX)
-
-@bot.message_handler(func=lambda message: get_state(message.from_user.id)[0] == BotState.CHOOSING_PREFIX)
-def list_groups(message):
-    prefix = message.text
-    session = SessionLocal()
-    try:
-        groups = session.query(Group).filter(Group.name.like(f'{prefix}%')).all()
-        if groups:
-            markup = create_groups_markup(groups)
-            bot.send_message(message.chat.id, "Выберите группу:", reply_markup=markup)
-            set_state(message.from_user.id, BotState.CHOOSING_GROUP)
-        else:
-            bot.send_message(message.chat.id, f"Нет групп с префиксом '{prefix}'.")
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Ошибка: {e}")
-    finally:
-        session.close()
-
-# Убираем клавиатуру с префиксами после выбора группы
-@bot.message_handler(func=lambda message: True, content_types=['text'])
-def hide_keyboard(message):
-    if get_state(message.from_user.id)[0] == BotState.CHOOSING_GROUP:
-        bot.send_message(message.chat.id, "Клавиатура скрыта.", reply_markup=telebot.types.ReplyKeyboardRemove())
-        set_state(message.from_user.id, BotState.NORMAL)
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback_query(call):
-    state, data = get_state(call.from_user.id)
-    session = SessionLocal()
-
-    try:
-        if state == BotState.CHOOSING_GROUP:
-            if call.data.startswith('group_'):
-                group_id = int(call.data.split('_')[1])
-                students = session.query(Student).filter(Student.group_id == group_id).all()
-                markup = create_students_markup(students)
-                bot.send_message(call.message.chat.id, "Выберите студента:", reply_markup=markup)
-                set_state(call.from_user.id, BotState.CHOOSING_STUDENT, group_id)
-                
-        elif state == BotState.CHOOSING_STUDENT:
-            if call.data.startswith('student_'):
-                student_id = int(call.data.split('_')[1])
-                student = session.get(Student, student_id)
-                if student:
-                    markup = InlineKeyboardMarkup()
-                    markup.add(InlineKeyboardButton(text="Опоздал", callback_data=f'late_{student_id}'))
-                    markup.add(InlineKeyboardButton(text="Отсутствует", callback_data=f'absent_{student_id}'))
-                    bot.send_message(call.message.chat.id, "Выберите статус студента:", reply_markup=markup)
-                    set_state(call.from_user.id, BotState.CHOOSING_ACTION, student_id)
-                else:
-                    bot.send_message(call.message.chat.id, "Студент не найден.")
-                    
-        elif state == BotState.CHOOSING_ACTION:
-            if call.data.startswith('late_'):
-                student_id = int(call.data.split('_')[1])
-                bot.send_message(call.message.chat.id, "Введите количество минут опоздания:")
-                set_state(call.from_user.id, BotState.WAITING_FOR_MINUTES, student_id)
-            elif call.data.startswith('absent_'):
-                student_id = int(call.data.split('_')[1])
-                mark_attendance_absent(call.message, student_id)
-                set_state(call.from_user.id, BotState.NORMAL)
-                
-        elif state == BotState.WAITING_FOR_MINUTES:
-            # Handle waiting for minutes state here
-            pass
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"Ошибка: {e}")
-    finally:
-        session.close()
-    bot.answer_callback_query(call.id)
-
-
-
-
-
-@bot.message_handler(func=lambda message: get_state(message.from_user.id)[0] == BotState.WAITING_FOR_MINUTES)
-def manual_late_minutes_input(message):
-    student_id = get_state(message.from_user.id)[1]
-    try:
-        minutes_late = int(message.text)
-        mark_attendance_late(message, student_id, minutes_late)
-        set_state(message.from_user.id, BotState.NORMAL)
-    except ValueError:
-        bot.reply_to(message, "Пожалуйста, введите число. Попробуйте снова.")
-
 @bot.message_handler(commands=['cancel'])
 def handle_cancel(message):
-    set_state(message.from_user.id, BotState.NORMAL)
     bot.reply_to(message, "Текущее действие отменено.")
-    
+    bot.send_message(message.chat.id, "Привет! Чтобы отметить студента, начните с выбора группы командой /groups", reply_markup=ReplyKeyboardRemove())
+
 @bot.message_handler(commands=['export'])
 def handle_export_command(message):
     chat_id = message.chat.id
@@ -243,57 +167,48 @@ def handle_export_command(message):
 def command_add_group(message):
     try:
         group_name = message.text.split(maxsplit=1)[1]  # Получаем имя группы после команды
-        group_id = add_group(group_name)
-        if group_id:
-            bot.reply_to(message, f"Группа '{group_name}' успешно добавлена с ID {group_id}.")
-        else:
-            bot.reply_to(message, "Не удалось добавить группу.")
+        session = SessionLocal()
+        new_group = Group(name=group_name)
+        session.add(new_group)
+        session.commit()
+        bot.reply_to(message, f"Группа '{group_name}' успешно добавлена с ID {new_group.id}.")
+        session.close()
     except IndexError:
         bot.reply_to(message, "Пожалуйста, укажите название группы после команды /addgroup.")
-
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка при добавлении группы: {e}")
 
 @bot.message_handler(commands=['addstudents'])
 def command_add_students(message):
+    bot.send_message(message.chat.id, "Выберите группу для добавления студентов:", reply_markup=create_groups_markup())
+    bot.register_next_step_handler(message, add_students)
+
+def create_groups_markup():
+    markup = InlineKeyboardMarkup()
     session = SessionLocal()
+    groups = session.query(Group).all()
+    for group in groups:
+        markup.add(InlineKeyboardButton(text=group.name, callback_data=f'addstudent_{group.id}'))
+    session.close()
+    return markup
+
+def add_students(message):
+    group_id = int(message.text.split('_')[1])
+    bot.send_message(message.chat.id, "Пожалуйста, отправьте список студентов в формате 'Имя Фамилия', каждый студент на новой строке.")
+    bot.register_next_step_handler(message, lambda m: save_students(m, group_id))
+
+def save_students(message, group_id):
     try:
-        groups = session.query(Group).all()
-        markup = InlineKeyboardMarkup()
-        for group in groups:
-            markup.add(InlineKeyboardButton(text=group.name, callback_data=f'addstudent_{group.id}'))
-        bot.send_message(message.chat.id, "Выберите группу для добавления студентов:", reply_markup=markup)
-    except Exception as e:
-        bot.send_message(message.chat.id, f"Ошибка: {e}")
-    finally:
+        session = SessionLocal()
+        students_list = message.text.split('\n')
+        for student_name in students_list:
+            first_name, last_name = student_name.strip().split(' ', 1)
+            new_student = Student(first_name=first_name, last_name=last_name, group_id=group_id)
+            session.add(new_student)
+        session.commit()
+        bot.reply_to(message, f"Студенты успешно добавлены в группу.")
         session.close()
+    except Exception as e:
+        bot.reply_to(message, f"Ошибка при добавлении студентов: {e}")
 
-
-# Обработчик для кнопок выбора группы
-@bot.callback_query_handler(func=lambda call: call.data.startswith('group_'))
-def callback_select_group(call):
-    group_id = int(call.data.split('_')[1])
-    session = SessionLocal()  # Создаем новую сессию
-    set_state(call.from_user.id, BotState.CHOOSING_STUDENT, group_id)
-    students = session.query(Student).filter(Student.group_id == group_id).all()
-    markup = create_students_markup(students)
-    bot.edit_message_text("Выберите студента:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
-    bot.answer_callback_query(call.id)  # Подтверждение обработки
-    session.close()  # Не забудьте закрыть сессию
-
-# Обработчик для кнопок добавления студентов
-@bot.callback_query_handler(func=lambda call: call.data.startswith('addstudent_'))
-def callback_add_students(call):
-    group_id = int(call.data.split('_')[1])
-    set_state(call.from_user.id, BotState.ADDING_STUDENTS, group_id)
-    bot.send_message(call.message.chat.id, "Пожалуйста, отправьте список студентов в формате 'Имя Фамилия', каждый студент на новой строке.")
-    bot.answer_callback_query(call.id)  # Подтверждение обработки
-    
-# Обработчик для кнопок выбора минут опоздания
-@bot.callback_query_handler(func=lambda call: call.data.startswith('minutes_'))
-def callback_minutes_late(call):
-    student_id, minutes = call.data.split('_')[1:]
-    mark_attendance_late(call.message, int(student_id), int(minutes))
-    set_state(call.from_user.id, BotState.NORMAL)
-    bot.answer_callback_query(call.id)  # Подтверждение обработки
-
-bot.polling(none_stop=True)
-
+bot.polling()
