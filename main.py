@@ -1,3 +1,4 @@
+import threading
 import time
 import schedule
 import telebot
@@ -13,20 +14,27 @@ bot = telebot.TeleBot(TOKEN)
 
 PREFIXES = ["ИС", "ТМ", "П", "ЭВМ", "РЭТ", "КПИиА"]
 
+PING_INTERVAL_SECONDS = 20
+
 auth_users = {}
 
 init_db()  # Инициализация базы данных
 
 def ping_bot():
-    try:
-        bot.send_chat_action(chat_id="2099795903", action="typing")
-        print("Bot is alive!")
-    except Exception as e:
-        print(f"Bot is down! Error: {e}")
-        print("Restarting bot...")
-        start_bot()
+    while True:
+        try:
+            bot.send_chat_action(chat_id="2099795903", action="typing")
+            print("Bot is alive!")
+        except Exception as e:
+            print(f"Bot is down! Error: {e}")
+            print("Restarting bot...")
+            start_bot()
+        time.sleep(PING_INTERVAL_SECONDS)
 
 schedule.every(5).minutes.do(ping_bot)
+
+ping_thread = threading.Thread(target=ping_bot)
+ping_thread.start()
 
 def start_bot():
     try:
@@ -90,6 +98,12 @@ def process_password_step(message, username):
     else:
         bot.send_message(message.chat.id, "Неверный логин или пароль!")
 
+def create_main_keyboard():
+    keyboard = telebot.types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    keyboard.row("Отметить студента", "Экспорт данных")
+    keyboard.row("Войти в систему")
+    return keyboard
+
 # Обработчик команды /logout
 @bot.message_handler(commands=['logout'])
 def logout(message):
@@ -105,9 +119,20 @@ def auth_required(func):
             bot.send_message(message.chat.id, "Вы не авторизованы!")
     return wrapper
 
-@bot.message_handler(commands=['start', 'help'])
+@bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "Привет! Чтобы отметить студента, начните с выбора группы командой /groups")
+    bot.reply_to(message, "Привет! Выберите действие:", reply_markup=create_main_keyboard())
+
+@bot.message_handler(func=lambda message: True)
+def handle_messages(message):
+    if message.text == "Отметить студента":
+        choose_prefix(message)
+    elif message.text == "Экспорт данных":
+        handle_export_command(message)
+    elif message.text == "Войти в систему":
+        login(message)
+    else:
+        bot.reply_to(message, "Извините, я не могу понять ваш запрос. Пожалуйста, используйте кнопки на клавиатуре.")
 
 @bot.message_handler(commands=['groups'])
 @auth_required
